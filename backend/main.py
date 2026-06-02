@@ -1,19 +1,29 @@
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, model_validator
+from typing import Optional, List
 import pandas as pd
+import numpy as np
 import io
+import json
 
-from risk_engine import preprocess_broker_data, get_risk_metrics
+from risk_engine import (
+    preprocess_broker_data,
+    get_risk_metrics,
+    build_blended_benchmark_returns,
+    compare_performance,
+)
 
 app = FastAPI(
     title="Portfolio Risk Analyzer API",
     description=(
         "Accepts broker-style holdings CSV exports. "
         "Fetches historical prices via yfinance. "
-        "Computes institutional-grade quantitative risk analytics."
+        "Computes institutional-grade quantitative risk analytics "
+        "with single and blended benchmark comparison."
     ),
-    version="2.0.0"
+    version="3.0.0"
 )
 
 app.add_middleware(
@@ -25,31 +35,98 @@ app.add_middleware(
 )
 
 
+# ═══════════════════════════════════════════════════════════════════
+# Pydantic v2 Request / Response Models
+# ═══════════════════════════════════════════════════════════════════
+
+class BlendedBenchmark(BaseModel):
+    tickers: List[str]
+    weights: List[float]
+
+    @model_validator(mode="after")
+    def validate_blended(self):
+        if len(self.tickers) != len(self.weights):
+            raise ValueError(
+                f"tickers ({len(self.tickers)}) and weights ({len(self.weights)}) must have equal length."
+            )
+        if any(w < 0 for w in self.weights):
+            raise ValueError("All blended benchmark weights must be non-negative.")
+        if not np.isclose(sum(self.weights), 1.0, atol=1e-6):
+            raise ValueError(
+                f"Blended benchmark weights must sum to 1.0 (got {sum(self.weights):.6f})."
+            )
+        return self
+
+
+class ComparisonResponse(BaseModel):
+    portfolio_cumulative_return: Optional[float] = None
+    benchmark_cumulative_return: Optional[float] = None
+    blended_benchmark_cumulative_return: Optional[float] = None
+    performance_vs_single: Optional[str] = None
+    performance_vs_blended: Optional[str] = None
+    relative_gap_single: Optional[float] = None
+    relative_gap_blended: Optional[float] = None
+    sharpe_portfolio: Optional[float] = None
+    sharpe_benchmark: Optional[float] = None
+    relative_sharpe_vs_single: Optional[float] = None
+    tracking_error_blended: Optional[float] = None
+    information_ratio_blended: Optional[float] = None
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Endpoints
+# ═══════════════════════════════════════════════════════════════════
+
 @app.get("/")
+@app.get("/health")
 def health_check():
     return {
         "status": "online",
         "engine": "broker_csv_risk_analytics",
-        "version": "2.0.0"
+        "version": "3.0.0",
+        "features": ["single_benchmark", "blended_benchmark", "monte_carlo_30d"]
     }
 
 
 @app.post("/analyze")
 async def analyze_portfolio(
     file: UploadFile = File(...),
-    benchmark_ticker: str = Form(...),        # Required: e.g. "^NSEI"
+    benchmark_ticker: Optional[str] = Form(None),
+    blended_benchmark: Optional[str] = Form(None),   # JSON string
     risk_free_rate: float = Form(0.0),
     confidence_level: float = Form(0.95),
     simulations: int = Form(10000),
-    history_days: int = Form(365)             # How far back to fetch (default: 1 year)
+    history_days: int = Form(365),
 ):
     """
     Accepts a broker-style holdings CSV (Ticker, Portfolio Weight %, ...).
     Automatically fetches all historical prices from yfinance.
-    Returns full quantitative risk report.
+    Supports single benchmark, blended benchmark, or both.
+    Returns full quantitative risk report with performance comparison.
     """
     try:
-        # 1. Read uploaded CSV
+        # ── Parse & validate blended benchmark JSON ──────────────────
+        blended_config: Optional[BlendedBenchmark] = None
+        if blended_benchmark:
+            try:
+                blended_dict = json.loads(blended_benchmark)
+                blended_config = BlendedBenchmark(**blended_dict)
+            except json.JSONDecodeError:
+                raise HTTPException(
+                    status_code=400,
+                    detail="blended_benchmark must be a valid JSON string."
+                )
+            except Exception as ve:
+                raise HTTPException(status_code=400, detail=str(ve))
+
+        # ── Validate: at least one benchmark must be provided ────────
+        if not benchmark_ticker and not blended_config:
+            raise HTTPException(
+                status_code=400,
+                detail="At least one of 'benchmark_ticker' or 'blended_benchmark' must be provided."
+            )
+
+        # ── 1. Read uploaded CSV ─────────────────────────────────────
         contents = await file.read()
         try:
             df = pd.read_csv(io.BytesIO(contents))
@@ -66,7 +143,10 @@ async def analyze_portfolio(
             )
 
         # 2. Parse holdings + fetch prices + align benchmark
-        asset_returns, bench_returns, weights, asset_names, portfolio_value = preprocess_broker_data(
+        (
+            asset_returns, bench_returns, weights, asset_names, 
+            portfolio_value, start_date, end_date
+        ) = preprocess_broker_data(
             df=df,
             benchmark_ticker=benchmark_ticker,
             history_days=history_days
